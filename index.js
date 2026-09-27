@@ -1,5 +1,6 @@
 const { Telegraf, Markup, Scenes, session } = require('telegraf');
 const fs = require('fs');
+const http = require('http');
 require('dotenv').config();
 
 // ⚠️⚠️⚠️ SOZLAMALARNI TO'LDIRING ⚠️⚠️⚠️
@@ -1191,18 +1192,53 @@ bot.on('text', async (ctx) => {
   await sendMovieToUser(ctx, ctx.message.text.trim());
 });
 
-bot.launch();
-console.log('🚀 Yangi professional bot ishga tushdi!');
+// ---------------------------------------------------------
+// ISHGA TUSHIRISH: WEBHOOK (bepul hostinglar uchun, masalan Render)
+// yoki POLLING (lokal kompyuter / VPS uchun)
+// ---------------------------------------------------------
+const PORT = process.env.PORT || 3000;
+// Render kabi xizmatlar bu manzilni o'zi avtomatik beradi (RENDER_EXTERNAL_URL).
+// Boshqa xizmat ishlatsangiz, .env faylida WEBHOOK_URL=https://... deb qo'lda yozing.
+const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL || process.env.WEBHOOK_URL;
+const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`;
 
-// Asosiy kanalning haqiqiy nomini olib, majburiy obuna xabarlarida shu nom ko'rinishi uchun
-bot.telegram
-  .getChat(MAIN_CHANNEL_ID)
-  .then((chat) => {
-    mainChannelTitle = chat.title || mainChannelTitle;
-  })
-  .catch(() => {
-    console.log("⚠️ Asosiy kanal ma'lumotini olib bo'lmadi. Bot kanalda ADMIN ekanini tekshiring!");
-  });
+let server;
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+async function startBot() {
+  if (WEBHOOK_URL) {
+    await bot.telegram.setWebhook(`${WEBHOOK_URL}${WEBHOOK_PATH}`);
+    server = http.createServer((req, res) => {
+      // UptimeRobot yoki boshqa "ping" xizmati botni uyg'oq ushlab turishi uchun oddiy sahifa
+      if (req.url === '/' || req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('Bot ishlayapti ✅');
+      }
+      return bot.webhookCallback(WEBHOOK_PATH)(req, res);
+    });
+    server.listen(PORT, () => {
+      console.log(`🚀 Webhook rejimida ishga tushdi: ${WEBHOOK_URL}${WEBHOOK_PATH}`);
+    });
+  } else {
+    await bot.launch();
+    console.log('🚀 Polling rejimida (lokal/VPS) ishga tushdi!');
+  }
+
+  // Asosiy kanalning haqiqiy nomini olib, majburiy obuna xabarlarida shu nom ko'rinishi uchun
+  bot.telegram
+    .getChat(MAIN_CHANNEL_ID)
+    .then((chat) => {
+      mainChannelTitle = chat.title || mainChannelTitle;
+    })
+    .catch(() => {
+      console.log("⚠️ Asosiy kanal ma'lumotini olib bo'lmadi. Bot kanalda ADMIN ekanini tekshiring!");
+    });
+}
+
+startBot();
+
+function shutdown(signal) {
+  if (server) server.close();
+  bot.stop(signal);
+}
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
