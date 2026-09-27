@@ -1,0 +1,6 @@
+.env
+node_modules/
+movies.json
+subchannels.json
+users.json
+favorites.json
