@@ -1,5 +1,5 @@
 const { Telegraf, Markup, Scenes, session } = require('telegraf');
-const fs = require('fs');
+const { MongoClient } = require('mongodb');
 const http = require('http');
 require('dotenv').config();
 
@@ -12,6 +12,11 @@ if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN topilmadi! '.env' faylida BOT_TOKEN=... qatorini to'ldiring.");
   process.exit(1);
 }
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  console.error("❌ MONGODB_URI topilmadi! '.env' faylida MONGODB_URI=... qatorini to'ldiring.");
+  process.exit(1);
+}
 const ADMIN_ID = 6846408281; // Telegram ID'ingiz (son ko'rinishida)
 const BAZA_CHANNEL_ID = '-1003985421760'; // Kinolar saqlanadigan yopiq kanal (ID)
 const BAZA_CHANNEL_LINK = ''; // Yopiq kanalning taklif havolasi (https://t.me/+xxxxx). Bo'sh qoldirsangiz tugma ko'rsatilmaydi.
@@ -20,51 +25,108 @@ const BOT_USERNAME_OVERRIDE = 'aero_kino_bot'; // Caption'da ko'rsatiladigan use
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// Kinolar bazasi fayli
-const DB_FILE = './movies.json';
-let movies = fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE)) : {};
+// ---------------------------------------------------------
+// MONGODB ULANISHI
+// ---------------------------------------------------------
+// Barcha ma'lumotlar (kinolar, kanallar, foydalanuvchilar, sevimlilar, adminlar)
+// endi JSON fayllar o'rniga MongoDB'da saqlanadi. Bu Render kabi bepul hostinglarda
+// ham ma'lumot yo'qolib ketmasligini ta'minlaydi (fayl tizimi vaqtinchalik bo'lsa ham).
+//
+// Xotirada (RAM) esa avvalgidek oddiy JS o'zgaruvchilar (movies, subChannels, users,
+// favorites, admins) ishlatiladi — bot tezkor ishlashi uchun. Har bir o'zgarishda
+// MongoDB'ga ham yozib qo'yiladi (write-through), bot qayta ishga tushganda esa
+// hammasi MongoDB'dan qayta yuklanadi.
+const mongoClient = new MongoClient(MONGODB_URI);
+let db;
+let moviesCollection;
+let configCollection;
 
-function saveDB() {
-  fs.writeFileSync(DB_FILE, JSON.stringify(movies, null, 2));
+async function connectDB() {
+  await mongoClient.connect();
+  db = mongoClient.db('aero_kino_bot');
+  moviesCollection = db.collection('movies');
+  configCollection = db.collection('config');
+  console.log('🗄️  MongoDB\'ga muvaffaqiyatli ulandi!');
+}
+
+// "config" kolleksiyasidagi oddiy kalit-qiymat yozuvlari (kanallar, foydalanuvchilar,
+// sevimlilar, adminlar ro'yxati) uchun umumiy yordamchi funksiyalar
+async function loadConfig(key, fallback) {
+  const doc = await configCollection.findOne({ _id: key });
+  return doc ? doc.value : fallback;
+}
+
+async function saveConfig(key, value) {
+  await configCollection.updateOne({ _id: key }, { $set: { value } }, { upsert: true });
+}
+
+// Kinolar bazasi (xotirada keshlangan holat)
+let movies = {};
+
+// Bitta kinoni MongoDB'ga yozish (qo'shishda/tahrirlashda ishlatiladi)
+async function saveMovie(code) {
+  const movie = movies[code];
+  if (!movie) return;
+  await moviesCollection.updateOne({ _id: code }, { $set: movie }, { upsert: true });
+}
+
+// Kinoni MongoDB'dan butunlay o'chirish
+async function deleteMovieDoc(code) {
+  await moviesCollection.deleteOne({ _id: code });
 }
 
 // Majburiy obuna kanallari bazasi
-const CHANNELS_FILE = './subchannels.json';
-let subChannels = fs.existsSync(CHANNELS_FILE) ? JSON.parse(fs.readFileSync(CHANNELS_FILE)) : [];
+let subChannels = [];
 
-function saveChannels() {
-  fs.writeFileSync(CHANNELS_FILE, JSON.stringify(subChannels, null, 2));
+async function saveChannels() {
+  await saveConfig('subchannels', subChannels);
 }
 
 // Foydalanuvchilar bazasi (xabar yuborish - broadcast uchun)
-const USERS_FILE = './users.json';
-let users = fs.existsSync(USERS_FILE) ? JSON.parse(fs.readFileSync(USERS_FILE)) : [];
+let users = [];
 
-function saveUsers() {
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+async function saveUsers() {
+  await saveConfig('users', users);
 }
 
-function addUser(id) {
+async function addUser(id) {
   if (!users.includes(id)) {
     users.push(id);
-    saveUsers();
+    await saveUsers();
   }
 }
 
 // Sevimlilar bazasi: { [userId]: [kod1, kod2, ...] }
-const FAVORITES_FILE = './favorites.json';
-let favorites = fs.existsSync(FAVORITES_FILE) ? JSON.parse(fs.readFileSync(FAVORITES_FILE)) : {};
+let favorites = {};
 
-function saveFavorites() {
-  fs.writeFileSync(FAVORITES_FILE, JSON.stringify(favorites, null, 2));
+async function saveFavorites() {
+  await saveConfig('favorites', favorites);
 }
 
 // Qo'shimcha adminlar bazasi (asosiy ADMIN_ID bundan tashqari, alohida saqlanadi)
-const ADMINS_FILE = './admins.json';
-let admins = fs.existsSync(ADMINS_FILE) ? JSON.parse(fs.readFileSync(ADMINS_FILE)) : [];
+let admins = [];
 
-function saveAdmins() {
-  fs.writeFileSync(ADMINS_FILE, JSON.stringify(admins, null, 2));
+async function saveAdmins() {
+  await saveConfig('admins', admins);
+}
+
+// Botni ishga tushirishdan oldin barcha ma'lumotlarni MongoDB'dan xotiraga yuklaydi
+async function loadAllData() {
+  const movieDocs = await moviesCollection.find({}).toArray();
+  movies = {};
+  movieDocs.forEach((doc) => {
+    const { _id, ...rest } = doc;
+    movies[_id] = rest;
+  });
+
+  subChannels = await loadConfig('subchannels', []);
+  users = await loadConfig('users', []);
+  favorites = await loadConfig('favorites', {});
+  admins = await loadConfig('admins', []);
+
+  console.log(
+    `📥 MongoDB'dan yuklandi: ${Object.keys(movies).length} kino, ${users.length} foydalanuvchi, ${subChannels.length} qo'shimcha kanal, ${admins.length} qo'shimcha admin.`
+  );
 }
 
 // Kinoning o'rtacha reytingi va baholar sonini hisoblaydi
@@ -349,7 +411,7 @@ const addMovieWizard = new Scenes.WizardScene(
         video_message_id: sentVideo.message_id,
         photo_message_id: sentPhoto.message_id,
       };
-      saveDB();
+      await saveMovie(nextCode);
 
       await ctx.reply(
         `✅ *Kino bazaga muvaffaqiyatli qo'shildi!*\n\n🔑 *Kino ID'si:* \`${nextCode}\`\n\nUshbu ID orqali kelajakda kinoni tahrirlashingiz yoki o'chirishingiz mumkin.`,
@@ -492,7 +554,7 @@ const editMovieWizard = new Scenes.WizardScene(
         movie.video_message_id = sentVideo.message_id;
       }
 
-      saveDB();
+      await saveMovie(id);
       await ctx.reply(`✅ *${id}* ID'li kino muvaffaqiyatli yangilandi!`, {
         parse_mode: 'Markdown',
         ...getMainMenu(ctx.from.id),
@@ -570,7 +632,7 @@ const deleteMovieWizard = new Scenes.WizardScene(
       } catch (e) {}
 
       delete movies[id];
-      saveDB();
+      await deleteMovieDoc(id);
 
       // Barcha foydalanuvchilarning sevimlilar ro'yxatidan ham o'chirilgan kinoni tozalaymiz
       let favoritesChanged = false;
@@ -581,7 +643,7 @@ const deleteMovieWizard = new Scenes.WizardScene(
           favoritesChanged = true;
         }
       });
-      if (favoritesChanged) saveFavorites();
+      if (favoritesChanged) await saveFavorites();
 
       await ctx.editMessageText(`✅ \`${id}\` ID'li kino muvaffaqiyatli o'chirildi.`, { parse_mode: 'Markdown' });
     } else {
@@ -650,7 +712,7 @@ const addSubChannelWizard = new Scenes.WizardScene(
     if (chat.username) {
       ctx.wizard.state.newChannel.link = `https://t.me/${chat.username}`;
       subChannels.push(ctx.wizard.state.newChannel);
-      saveChannels();
+      await saveChannels();
       await ctx.reply(`✅ *${ctx.wizard.state.newChannel.title}* kanali majburiy obunaga qo'shildi!`, {
         parse_mode: 'Markdown',
         ...getMainMenu(ctx.from.id),
@@ -669,7 +731,7 @@ const addSubChannelWizard = new Scenes.WizardScene(
     if (!ctx.message || !ctx.message.text) return ctx.reply('Iltimos, havolani matn shaklida yuboring.');
     ctx.wizard.state.newChannel.link = ctx.message.text.trim();
     subChannels.push(ctx.wizard.state.newChannel);
-    saveChannels();
+    await saveChannels();
     await ctx.reply(`✅ *${ctx.wizard.state.newChannel.title}* kanali majburiy obunaga qo'shildi!`, {
       parse_mode: 'Markdown',
       ...getMainMenu(ctx.from.id),
@@ -827,7 +889,7 @@ const addCommentWizard = new Scenes.WizardScene(
       text: ctx.message.text,
       date: new Date().toISOString(),
     });
-    saveDB();
+    await saveMovie(code);
 
     await ctx.reply('✅ Izohingiz uchun rahmat!', getMainMenu(ctx.from.id));
     return ctx.scene.leave();
@@ -875,7 +937,7 @@ const addAdminWizard = new Scenes.WizardScene(
     }
 
     admins.push(newId);
-    saveAdmins();
+    await saveAdmins();
 
     await ctx.reply(`✅ *${newId}* ID'li foydalanuvchi endi admin!`, {
       parse_mode: 'Markdown',
@@ -998,7 +1060,7 @@ function buildSubChannelsPanelKeyboard() {
 
 // 1. /start
 bot.start(async (ctx) => {
-  addUser(ctx.from.id);
+  await addUser(ctx.from.id);
 
   // Agar foydalanuvchi kanaldagi "Ko'rish / Yuklab olish" tugmasi orqali kirgan bo'lsa
   // (masalan https://t.me/bot?start=5), to'g'ridan-to'g'ri o'sha kinoni yuboramiz
@@ -1099,11 +1161,11 @@ bot.action('admin_add_subchannel', (ctx) => {
   ctx.scene.enter('ADD_SUB_CHANNEL_SCENE');
 });
 
-bot.action(/^delsub_(\d+)$/, (ctx) => {
+bot.action(/^delsub_(\d+)$/, async (ctx) => {
   if (!isAdmin(ctx)) return ctx.answerCbQuery('❌ Ruxsat yo\'q');
   const index = parseInt(ctx.match[1], 10);
   const removed = subChannels.splice(index, 1);
-  saveChannels();
+  await saveChannels();
   ctx.answerCbQuery(removed.length ? `🗑 ${removed[0].title} o'chirildi` : 'O\'chirildi');
   ctx.editMessageText(buildSubChannelsPanelText(), {
     parse_mode: 'Markdown',
@@ -1154,11 +1216,11 @@ bot.action(/^deladmin_(\d+)$/, (ctx) => {
   );
 });
 
-bot.action(/^confirm_deladmin_(\d+)$/, (ctx) => {
+bot.action(/^confirm_deladmin_(\d+)$/, async (ctx) => {
   if (!isOwner(ctx)) return ctx.answerCbQuery('❌ Ruxsat yo\'q');
   const index = parseInt(ctx.match[1], 10);
   const removed = admins.splice(index, 1);
-  saveAdmins();
+  await saveAdmins();
   ctx.answerCbQuery(removed.length ? `🗑 ${removed[0]} olib tashlandi` : 'Olib tashlandi');
   ctx.editMessageText(buildAdminsPanelText(), {
     parse_mode: 'Markdown',
@@ -1179,7 +1241,7 @@ bot.action('check_subscription', async (ctx) => {
   const unsub = await getUnsubscribedChannels(ctx);
   if (unsub.length === 0) {
     await ctx.answerCbQuery('✅ Obuna tasdiqlandi!');
-    addUser(ctx.from.id);
+    await addUser(ctx.from.id);
     await ctx.deleteMessage().catch(() => {});
     await ctx.reply(`🎬 *Xush kelibsiz!*\n\n🔑 Kino kodini yuboring yoki pastdagi menyudan foydalaning:`, {
       parse_mode: 'Markdown',
@@ -1216,7 +1278,7 @@ bot.action(/^rate_(.+)_(\d+)_([1-5])$/, async (ctx) => {
 
   movie.ratings = movie.ratings || {};
   movie.ratings[ctx.from.id] = score;
-  saveDB();
+  await saveMovie(code);
 
   const stats = getRatingStats(movie);
   await ctx.answerCbQuery(
@@ -1258,7 +1320,7 @@ bot.action(/^fav_(.+)_(\d+)$/, async (ctx) => {
     favorites[userId].splice(idx, 1);
     added = false;
   }
-  saveFavorites();
+  await saveFavorites();
 
   await ctx.answerCbQuery(added ? '❤️ Sevimlilarga qo\'shildi!' : '💔 Sevimlilardan olib tashlandi!');
 
@@ -1356,6 +1418,10 @@ const WEBHOOK_PATH = `/webhook/${BOT_TOKEN}`;
 let server;
 
 async function startBot() {
+  // Botni ishga tushirishdan oldin MongoDB'ga ulanib, barcha ma'lumotlarni yuklaymiz
+  await connectDB();
+  await loadAllData();
+
   if (WEBHOOK_URL) {
     await bot.telegram.setWebhook(`${WEBHOOK_URL}${WEBHOOK_PATH}`);
     server = http.createServer((req, res) => {
@@ -1385,11 +1451,15 @@ async function startBot() {
     });
 }
 
-startBot();
+startBot().catch((e) => {
+  console.error('❌ Botni ishga tushirishda xatolik (ehtimol MongoDB ulanish muammosi):', e);
+  process.exit(1);
+});
 
 function shutdown(signal) {
   if (server) server.close();
   bot.stop(signal);
+  mongoClient.close();
 }
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
