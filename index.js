@@ -59,6 +59,14 @@ function saveFavorites() {
   fs.writeFileSync(FAVORITES_FILE, JSON.stringify(favorites, null, 2));
 }
 
+// Qo'shimcha adminlar bazasi (asosiy ADMIN_ID bundan tashqari, alohida saqlanadi)
+const ADMINS_FILE = './admins.json';
+let admins = fs.existsSync(ADMINS_FILE) ? JSON.parse(fs.readFileSync(ADMINS_FILE)) : [];
+
+function saveAdmins() {
+  fs.writeFileSync(ADMINS_FILE, JSON.stringify(admins, null, 2));
+}
+
 // Kinoning o'rtacha reytingi va baholar sonini hisoblaydi
 function getRatingStats(movie) {
   const values = movie.ratings ? Object.values(movie.ratings) : [];
@@ -112,7 +120,16 @@ function buildCaption(code, data, botUsername, partInfo, ratingInfo) {
 }
 
 function isAdmin(ctx) {
+  return ctx.from && isAdminId(ctx.from.id);
+}
+
+// Faqat asosiy (ADMIN_ID) — qo'shimcha adminlarni boshqarish huquqi faqat unga tegishli
+function isOwner(ctx) {
   return ctx.from && ctx.from.id === ADMIN_ID;
+}
+
+function isAdminId(id) {
+  return id === ADMIN_ID || admins.includes(id);
 }
 
 function getBotUsername(ctx) {
@@ -822,6 +839,57 @@ addCommentWizard.command('bekor', async (ctx) => {
   return ctx.scene.leave();
 });
 
+// ---------------------------------------------------------
+// ADMIN QO'SHISH SCENE (faqat owner uchun)
+// ---------------------------------------------------------
+const addAdminWizard = new Scenes.WizardScene(
+  'ADD_ADMIN_SCENE',
+
+  async (ctx) => {
+    await ctx.reply(
+      "👤 *Yangi admin qo'shish*\n\n" +
+        "Yangi adminning Telegram ID raqamini yuboring (masalan: `123456789`).\n" +
+        "ID'ni bilish uchun foydalanuvchi @userinfobot ga /start bosishi kifoya.\n\n" +
+        '❌ Bekor qilish uchun /bekor yozing.',
+      { parse_mode: 'Markdown' }
+    );
+    return ctx.wizard.next();
+  },
+
+  async (ctx) => {
+    if (!ctx.message || !ctx.message.text) return ctx.reply('Iltimos, ID raqamini matn shaklida yuboring.');
+    const idText = ctx.message.text.trim();
+
+    if (!/^\d+$/.test(idText)) {
+      await ctx.reply("❌ Bu to'g'ri ID emas. Faqat raqam yuboring (masalan: `123456789`) yoki /bekor yozing.", {
+        parse_mode: 'Markdown',
+      });
+      return;
+    }
+
+    const newId = Number(idText);
+
+    if (newId === ADMIN_ID || admins.includes(newId)) {
+      await ctx.reply('❌ Bu foydalanuvchi allaqachon admin.', getMainMenu(ctx.from.id));
+      return ctx.scene.leave();
+    }
+
+    admins.push(newId);
+    saveAdmins();
+
+    await ctx.reply(`✅ *${newId}* ID'li foydalanuvchi endi admin!`, {
+      parse_mode: 'Markdown',
+      ...getMainMenu(ctx.from.id),
+    });
+    return ctx.scene.leave();
+  }
+);
+
+addAdminWizard.command('bekor', async (ctx) => {
+  await ctx.reply('❌ Bekor qilindi.', getMainMenu(ctx.from.id));
+  return ctx.scene.leave();
+});
+
 // Stage va Session sozlamalari
 const stage = new Scenes.Stage([
   addMovieWizard,
@@ -831,6 +899,7 @@ const stage = new Scenes.Stage([
   addSubChannelWizard,
   broadcastWizard,
   addCommentWizard,
+  addAdminWizard,
 ]);
 bot.use(session());
 bot.use(stage.middleware());
@@ -865,22 +934,49 @@ function getMainMenu(userId) {
     ['📢 Asosiy Kanal'],
   ];
 
-  if (userId === ADMIN_ID) {
+  if (isAdminId(userId)) {
     buttons.unshift(['⚙️ Boshqarish paneli']);
   }
 
   return Markup.keyboard(buttons).resize();
 }
 
-const adminPanelKeyboard = Markup.inlineKeyboard([
-  [Markup.button.callback('🎬 Kino qo\'shish', 'admin_add_movie')],
-  [Markup.button.callback('✏️ Kino tahrirlash', 'admin_edit_movie'), Markup.button.callback('🗑 Kino o\'chirish', 'admin_delete_movie')],
-  [Markup.button.callback('📋 Kinolar ro\'yxati', 'admin_movies_list')],
-  [Markup.button.callback('📡 Majburiy obuna', 'admin_subchannels')],
-  [Markup.button.callback('📢 Kanalga post joylash', 'admin_post'), Markup.button.callback('📣 Xabar yuborish', 'admin_broadcast')],
-  [Markup.button.callback('📊 Statistika', 'admin_stats')],
-  [Markup.button.callback('❌ Panelni yopish', 'admin_close')],
-]);
+// Admin paneli klaviaturasi — "Adminlar" bo'limi faqat asosiy adminga (owner) ko'rinadi
+function buildAdminPanelKeyboard(ctx) {
+  const rows = [
+    [Markup.button.callback('🎬 Kino qo\'shish', 'admin_add_movie')],
+    [Markup.button.callback('✏️ Kino tahrirlash', 'admin_edit_movie'), Markup.button.callback('🗑 Kino o\'chirish', 'admin_delete_movie')],
+    [Markup.button.callback('📋 Kinolar ro\'yxati', 'admin_movies_list')],
+    [Markup.button.callback('📡 Majburiy obuna', 'admin_subchannels')],
+    [Markup.button.callback('📢 Kanalga post joylash', 'admin_post'), Markup.button.callback('📣 Xabar yuborish', 'admin_broadcast')],
+    [Markup.button.callback('📊 Statistika', 'admin_stats')],
+  ];
+
+  if (isOwner(ctx)) {
+    rows.push([Markup.button.callback('👤 Adminlar', 'admin_admins')]);
+  }
+
+  rows.push([Markup.button.callback('❌ Panelni yopish', 'admin_close')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+function buildAdminsPanelText() {
+  let text = `👤 *Adminlar ro'yxati*\n\n👑 Asosiy admin (siz) — ID: \`${ADMIN_ID}\`\n`;
+  if (admins.length) {
+    const lines = admins.map((id, i) => `${i + 1}. ID: \`${id}\``);
+    text += `\n➕ Qo'shimcha adminlar:\n${lines.join('\n')}\n\nOlib tashlash uchun adminga bosing:`;
+  } else {
+    text += "\nQo'shimcha adminlar hozircha yo'q.";
+  }
+  return text;
+}
+
+function buildAdminsPanelKeyboard() {
+  const rows = admins.map((id, i) => [Markup.button.callback(`🗑 ${id}`, `deladmin_${i}`)]);
+  rows.push([Markup.button.callback('➕ Admin qo\'shish', 'admin_add_admin')]);
+  rows.push([Markup.button.callback('🔙 Orqaga', 'admin_back')]);
+  return Markup.inlineKeyboard(rows);
+}
 
 function buildSubChannelsPanelText() {
   let text = `📡 *Majburiy obuna kanallari*\n\n✅ ${mainChannelTitle} (asosiy kanal — doim majburiy)\n`;
@@ -923,7 +1019,7 @@ bot.hears('⚙️ Boshqarish paneli', (ctx) => {
   if (isAdmin(ctx)) {
     ctx.reply(`🎛 *ADMIN BOSHQARUV PANELI*\n\nKerakli bo'limni tanlang 👇`, {
       parse_mode: 'Markdown',
-      ...adminPanelKeyboard,
+      ...buildAdminPanelKeyboard(ctx),
     });
   } else {
     ctx.reply('❌ Siz admin emassiz!');
@@ -1019,7 +1115,62 @@ bot.action('admin_back', (ctx) => {
   ctx.answerCbQuery();
   ctx.editMessageText(`🎛 *ADMIN BOSHQARUV PANELI*\n\nKerakli bo'limni tanlang 👇`, {
     parse_mode: 'Markdown',
-    ...adminPanelKeyboard,
+    ...buildAdminPanelKeyboard(ctx),
+  });
+});
+
+// --- Adminlarni boshqarish (faqat asosiy admin — owner) ---
+
+bot.action('admin_admins', (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery('❌ Ruxsat yo\'q');
+  ctx.answerCbQuery();
+  ctx.editMessageText(buildAdminsPanelText(), {
+    parse_mode: 'Markdown',
+    ...buildAdminsPanelKeyboard(),
+  }).catch(() => ctx.reply(buildAdminsPanelText(), { parse_mode: 'Markdown', ...buildAdminsPanelKeyboard() }));
+});
+
+bot.action('admin_add_admin', (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery('❌ Ruxsat yo\'q');
+  ctx.answerCbQuery();
+  ctx.scene.enter('ADD_ADMIN_SCENE');
+});
+
+// O'chirishdan oldin tasdiqlash so'raladi
+bot.action(/^deladmin_(\d+)$/, (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery('❌ Ruxsat yo\'q');
+  const index = parseInt(ctx.match[1], 10);
+  const targetId = admins[index];
+  if (targetId === undefined) return ctx.answerCbQuery('❌ Topilmadi');
+  ctx.answerCbQuery();
+  ctx.editMessageText(
+    `⚠️ *ID: \`${targetId}\`* adminni rostdan ham olib tashlamoqchimisiz?`,
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Ha, olib tashlash', `confirm_deladmin_${index}`), Markup.button.callback('❌ Yo\'q', 'cancel_deladmin')],
+      ]),
+    }
+  );
+});
+
+bot.action(/^confirm_deladmin_(\d+)$/, (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery('❌ Ruxsat yo\'q');
+  const index = parseInt(ctx.match[1], 10);
+  const removed = admins.splice(index, 1);
+  saveAdmins();
+  ctx.answerCbQuery(removed.length ? `🗑 ${removed[0]} olib tashlandi` : 'Olib tashlandi');
+  ctx.editMessageText(buildAdminsPanelText(), {
+    parse_mode: 'Markdown',
+    ...buildAdminsPanelKeyboard(),
+  });
+});
+
+bot.action('cancel_deladmin', (ctx) => {
+  ctx.answerCbQuery('Bekor qilindi');
+  ctx.editMessageText(buildAdminsPanelText(), {
+    parse_mode: 'Markdown',
+    ...buildAdminsPanelKeyboard(),
   });
 });
 
